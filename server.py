@@ -47,7 +47,8 @@ def server(host, port, application):
     environ['wsgi.multithread'] = False
     environ['wsgi.multiprocess'] = True
     environ['wsgi.run_once'] = True
-
+    environ['SERVER_NAME'] = host
+    environ['SERVER_PORT'] = port
     if environ.get('HTTPS', 'off') in ('on', '1'):
         environ['wsgi.url_scheme'] = 'https'
     else:
@@ -56,7 +57,7 @@ def server(host, port, application):
     serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serversocket.bind((host, port))
-    serversocket.listen(1)
+    serversocket.listen(50)
     serversocket.setblocking(0)
 
     epoll = select.epoll()
@@ -78,24 +79,38 @@ def server(host, port, application):
                     connections[conn_fileno] = conn
                     requests[conn_fileno] = b''
                 elif event & select.EPOLLIN:
+                    data = connections[fileno].recv(1024)
+                    if not data:
+                        epoll.modify(fileno, select.EPOLLET)
+                        connections[fileno].shutdown(socket.SHUT_RDWR)
+                        continue
                     if fileno in ct_length:
-                        envs[fileno]['wsgi.input'] += connections[fileno].recv(4096)
+                        envs[fileno]['wsgi.input'] += data
                         if ct_length[fileno] <= len(envs[fileno]['wsgi.input']):
                             epoll.modify(fileno, select.EPOLLOUT)
                             responses[fileno] = handle_request(envs[fileno],
                                                                application)
                         continue
-                    requests[fileno] += connections[fileno].recv(4096)
+                    requests[fileno] += data
                     if b'\r\n\r\n' in requests[fileno]:
                         #print('-'*40, '\n', requests[fileno])
                         header_data, body_data = ((requests[fileno][:-4], b'')
                                         if requests[fileno].endswith(b'\r\n\r\n')
-                                        else requests[fileno].split(b'\r\n\r\n'))
-                        method, path, protocol, headers = parse_headers(header_data)
+                                        else requests[fileno].split(b'\r\n\r\n', 1))
+                        method, query, protocol, headers = parse_headers(header_data)
+                        path, qs = (query.split('?')
+                                    if '?' in query and not query.endswith('?')
+                                    else (query, ''))
+                        __, script_name = path.rsplit('/', 1)
                         envs[fileno] = {
                             'REQUEST_METHOD': method,
-                            'REQUEST_PATH': path,
+                            'SCRIPT_NAME': script_name,
+                            'PATH_INFO': path,
+                            'QUERY_STRING': qs,
                             'HTTP_HEADERS': headers,
+                            'CONTENT_LENGTH': int(headers.get('Content-Length', 0)),
+                            'CONTENT_TYPE': headers.get('Content-Type', ''),
+                            'SERVER_PROTOCOL': protocol,
                             'wsgi.input': body_data
                         }
                         envs[fileno].update(environ)
@@ -106,7 +121,7 @@ def server(host, port, application):
                                 epoll.modify(fileno, 0)
                                 connections[fileno].shutdown(socket.SHUT_RDWR)
                             else:
-                                ct_length[fileno] = int(headers['Content-Length'])
+                                ct_length[fileno] = int()
                                 if ct_length[fileno] <= len(body_data):
                                     epoll.modify(fileno, select.EPOLLOUT)
                                     responses[fileno] = handle_request(envs[fileno],
