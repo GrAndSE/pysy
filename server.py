@@ -40,6 +40,19 @@ def parse_headers(data):
 def server(host, port, application):
     '''Run server
     '''
+    # Prepare base environment
+    environ = {k: unicode_to_wsgi(v) for k,v in os.environ.items()}
+    environ['wsgi.errors'] = sys.stderr
+    environ['wsgi.version'] = (1, 0)
+    environ['wsgi.multithread'] = False
+    environ['wsgi.multiprocess'] = True
+    environ['wsgi.run_once'] = True
+
+    if environ.get('HTTPS', 'off') in ('on', '1'):
+        environ['wsgi.url_scheme'] = 'https'
+    else:
+        environ['wsgi.url_scheme'] = 'http'
+    # Create socket
     serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serversocket.bind((host, port))
@@ -74,7 +87,7 @@ def server(host, port, application):
                         continue
                     requests[fileno] += connections[fileno].recv(4096)
                     if b'\r\n\r\n' in requests[fileno]:
-                        print('-'*40, '\n', requests[fileno])
+                        #print('-'*40, '\n', requests[fileno])
                         header_data, body_data = ((requests[fileno][:-4], b'')
                                         if requests[fileno].endswith(b'\r\n\r\n')
                                         else requests[fileno].split(b'\r\n\r\n'))
@@ -85,6 +98,7 @@ def server(host, port, application):
                             'HTTP_HEADERS': headers,
                             'wsgi.input': body_data
                         }
+                        envs[fileno].update(environ)
                         del requests[fileno]
                         if method in METHODS_WITH_BODY:
                             if not 'Content-Length' in headers:
@@ -147,22 +161,7 @@ def start_response_base(write, headers_set, status, response_headers,
     return write
 
 
-def handle_request(env, application):
-    print(handle_request, env, application)
-    # Prepare environment
-    environ = {k: unicode_to_wsgi(v) for k,v in os.environ.items()}
-    environ['wsgi.errors'] = sys.stderr
-    environ['wsgi.version'] = (1, 0)
-    environ['wsgi.multithread'] = False
-    environ['wsgi.multiprocess'] = True
-    environ['wsgi.run_once'] = True
-
-    if environ.get('HTTPS', 'off') in ('on', '1'):
-        environ['wsgi.url_scheme'] = 'https'
-    else:
-        environ['wsgi.url_scheme'] = 'http'
-    environ.update(env)
-
+def handle_request(environ, application):
     headers_set = None
     response = b''
 
