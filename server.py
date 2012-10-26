@@ -1,8 +1,12 @@
-import concurrent.futures
+#import concurrent.futures
+import functools
 import os
 import platform
+import select
 import socket
 import sys
+
+METHODS_WITH_BODY = frozenset(['POST', 'PUT', 'PATCH', ])
 
 esc = 'strict' if len(platform.win32_ver()[0]) > 0 else 'surrogateescape'
 enc = sys.getfilesystemencoding()
@@ -28,49 +32,125 @@ def parse_headers(data):
     string_data = data.decode('ascii')
     protocol_line, header_lines = string_data.split('\r\n', 1)
     method, tail = protocol_line.split(' ', 1)
-    query, protocol = tail.rsplit(' ', 1)
+    path, protocol = tail.rsplit(' ', 1)
     headers = [line.split(': ') for line in header_lines.split('\r\n')]
-    return method, query, protocol, dict(headers)
+    return method, path, protocol, dict(headers)
 
 
-def server(host, port):
+def server(host, port, application):
     '''Run server
     '''
     serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serversocket.bind((host, port))
-    serversocket.listen(1024)
-    while True:
-        conn, addr = serversocket.accept()
-        yield conn, addr
+    serversocket.listen(1)
+    serversocket.setblocking(0)
 
-
-def handle_connection(conn, addr, application):
-    # Parse the request, prepare request object
-    data = b''
-    print('Connection %s:%s' % addr)
-    while True:
-        print('Read chunk')
-        chunk = conn.recv(1024)
-        print(chunk)
-        if not chunk:
-            break
-        data += chunk
+    epoll = select.epoll()
+    epoll.register(serversocket.fileno(), select.EPOLLIN)
     try:
-        header_data, body_data = data.split(b'\r\n\r\n')
-        method, query, protocol, headers = parse_headers(header_data)
-        #if method in METHODS_WITH_BODY:
-        #    if 'Content-Length' not in headers:
-        #        raise Exception('No Content-Length header')
-        #    data_length = int(headers['Content-Length'])
-        #else:
-        #    body = b''
-    except Exception:
-        import sys
-        import traceback
-        traceback.print_exc(file=sys.stdout)
+        connections = {}
+        requests = {}
+        envs = {}
+        responses = {}
+        ct_length = {}
+        while True:
+            events = epoll.poll(1)
+            for fileno, event in events:
+                if fileno == serversocket.fileno():
+                    conn, addr = serversocket.accept()
+                    conn.setblocking(0)
+                    conn_fileno = conn.fileno()
+                    epoll.register(conn_fileno, select.EPOLLIN)
+                    connections[conn_fileno] = conn
+                    requests[conn_fileno] = b''
+                elif event & select.EPOLLIN:
+                    if fileno in ct_length:
+                        envs[fileno]['wsgi.input'] += connections[fileno].recv(4096)
+                        if ct_length[fileno] <= len(envs[fileno]['wsgi.input']):
+                            epoll.modify(fileno, select.EPOLLOUT)
+                            responses[fileno] = handle_request(envs[fileno],
+                                                               application)
+                        continue
+                    requests[fileno] += connections[fileno].recv(4096)
+                    if b'\r\n\r\n' in requests[fileno]:
+                        print('-'*40, '\n', requests[fileno])
+                        header_data, body_data = ((requests[fileno][:-4], b'')
+                                        if requests[fileno].endswith(b'\r\n\r\n')
+                                        else requests[fileno].split(b'\r\n\r\n'))
+                        method, path, protocol, headers = parse_headers(header_data)
+                        envs[fileno] = {
+                            'REQUEST_METHOD': method,
+                            'REQUEST_PATH': path,
+                            'HTTP_HEADERS': headers,
+                            'wsgi.input': body_data
+                        }
+                        del requests[fileno]
+                        if method in METHODS_WITH_BODY:
+                            if not 'Content-Length' in headers:
+                                # Drop request without a Content-Length specified
+                                epoll.modify(fileno, 0)
+                                connections[fileno].shutdown(socket.SHUT_RDWR)
+                            else:
+                                ct_length[fileno] = int(headers['Content-Length'])
+                                if ct_length[fileno] <= len(body_data):
+                                    epoll.modify(fileno, select.EPOLLOUT)
+                                    responses[fileno] = handle_request(envs[fileno],
+                                                                       application)
+                        else:
+                            epoll.modify(fileno, select.EPOLLOUT)
+                            responses[fileno] = handle_request(envs[fileno],
+                                                               application)
+
+                elif event & select.EPOLLOUT:
+                    if fileno in responses:
+                        bytes_written = connections[fileno].send(responses[fileno])
+                        responses[fileno] = responses[fileno][bytes_written:]
+                        if len(responses[fileno]) == 0:
+                            epoll.modify(fileno, 0)
+                            connections[fileno].shutdown(socket.SHUT_RDWR)
+                elif event & select.EPOLLHUP:
+                    epoll.unregister(fileno)
+                    connections[fileno].close()
+                    del connections[fileno]
+    finally:
+        epoll.unregister(serversocket.fileno())
+        epoll.close()
+        serversocket.close()
+
+
+def write_to_response(response, data):
+    '''Write some data into response
+    '''
+    response += wsgi_to_bytes(data)
+
+
+def start_response_base(write, headers_set, status, response_headers,
+                        exc_info=None):
+    '''Function that starts the response sending headers
+    '''
+    # Playing with exceptions
+    if exc_info:
+        try:
+            if headers_set:
+                # Re-raise original exception if headers sent
+                raise exc_info[1].with_traceback(exc_info[2])
+        finally:
+            exc_info = None     # avoid dangling circular ref
+    elif headers_set:
+        raise AssertionError("Headers already set!")
+    # Prepare headers and send it
+    headers_set = (['HTTP/1.1 ', status, '\r\nStatus: ', status, '\r\n'] +
+                   ['%s: %s\r\n' % header for header in response_headers] +
+                   ['\r\n'])
+    write(''.join(headers_set))
+    return write
+
+
+def handle_request(env, application):
+    print(handle_request, env, application)
     # Prepare environment
     environ = {k: unicode_to_wsgi(v) for k,v in os.environ.items()}
-    environ['wsgi.input'] = body_data
     environ['wsgi.errors'] = sys.stderr
     environ['wsgi.version'] = (1, 0)
     environ['wsgi.multithread'] = False
@@ -81,33 +161,14 @@ def handle_connection(conn, addr, application):
         environ['wsgi.url_scheme'] = 'https'
     else:
         environ['wsgi.url_scheme'] = 'http'
+    environ.update(env)
 
     headers_set = None
+    response = b''
 
-    def write(data):
-        conn.send()
+    write = functools.partial(write_to_response, response)
+    start_response = functools.partial(start_response_base, write, headers_set)
 
-    def start_response(status, response_headers, exc_info=None):
-        '''Function that starts the response sending headers
-        '''
-        # Playing with exceptions
-        if exc_info:
-            try:
-                if headers_set:
-                    # Re-raise original exception if headers sent
-                    raise exc_info[1].with_traceback(exc_info[2])
-            finally:
-                exc_info = None     # avoid dangling circular ref
-        elif headers_set:
-            raise AssertionError("Headers already set!")
-        # Prepare headers and send it
-        headers_set = [b'HTTP/1.1 ', wsgi_to_bytes(status),
-                       b'\r\nStatus: ', wsgi_to_bytes(status), b'\r\n']
-        headers_set.extend([wsgi_to_bytes('%s: %s\r\n' % header)
-                            for header in response_headers])
-        headers_set.append(b'\r\n')
-        conn.send(b''.join(headers_set))
-        return write
     # Execute application and send the response
     result = application(environ, start_response)
     try:
@@ -117,7 +178,7 @@ def handle_connection(conn, addr, application):
     finally:
         if hasattr(result, 'close'):
             result.close()
-    conn.close()
+    return response
 
 
 def my_handler(request, start_response):
@@ -130,10 +191,7 @@ def my_handler(request, start_response):
 
 
 def run_server(host, port, application):
-    #with concurrent.futures.ProcessPoolExecutor() as executor:
-    for conn, addr in server(host, port):
-        #    executor.submit(
-        handle_connection(conn, addr, application)
+    server(host, port, application)
 
 
 if __name__ == '__main__':
